@@ -9,6 +9,7 @@ from typing import Union, List, Optional
 import re
 import ssl
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import certifi
@@ -50,7 +51,45 @@ COOKIE_CAPTURE_URLS = {
     "global": "https://www.icloud.com/icloudplus/",
     "china": "https://www.icloud.com.cn/icloudplus/",
 }
-HIDEMYEMAIL_APP_PATH = "/applications/hidemyemail/current/"
+HIDEMYEMAIL_APP_PATH = "/applications/hidemyemail/"
+CAPTURE_BROWSER_CHANNELS = {
+    "auto": ("msedge", "chrome"),
+    "chrome": ("chrome",),
+    "edge": ("msedge",),
+}
+
+
+def is_hidemyemail_app_request(request_url: str, region: str) -> bool:
+    """Match only the authenticated HME application document for a region."""
+    try:
+        parsed = urlparse(request_url)
+        expected = urlparse(COOKIE_CAPTURE_URLS[region])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if parsed.scheme.lower() != "https" or parsed.hostname != expected.hostname:
+        return False
+    if not re.fullmatch(
+        r"/applications/hidemyemail/[A-Za-z0-9._-]+/"
+        r"[A-Za-z]{2}(?:-[A-Za-z]{2})?/index\.html",
+        parsed.path,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    root_domains = parse_qs(parsed.query, keep_blank_values=True).get("rootDomain")
+    return bool(root_domains) and all(value == "www" for value in root_domains)
+
+
+def browser_cookie_header(cookies: list[dict]) -> str:
+    pairs = []
+    seen_names = set()
+    for cookie in cookies:
+        name = str(cookie.get("name", "")).strip()
+        value = cookie.get("value")
+        if not name or value is None or name in seen_names:
+            continue
+        seen_names.add(name)
+        pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
 
 
 def maildomain_suffix(region: str) -> str:
@@ -654,10 +693,36 @@ def whoamicommand(cookie_file: str, region: str, result_json: Optional[str]):
     type=REGION_CHOICE,
     help="iCloud region to use / iCloud 区域",
 )
-def capturecookiecommand(cookie_file: str, region: str):
+@click.option(
+    "--browser",
+    default="auto",
+    show_default=True,
+    type=click.Choice(tuple(CAPTURE_BROWSER_CHANNELS)),
+    help="Browser used for authorization / 授权浏览器",
+)
+@click.option(
+    "--timeout-seconds",
+    default=300,
+    show_default=True,
+    type=click.IntRange(30, 900),
+    help="Maximum time to wait for authorization / 授权等待秒数",
+)
+def capturecookiecommand(
+    cookie_file: str,
+    region: str,
+    browser: str,
+    timeout_seconds: int,
+):
     "Open iCloud Plus and capture the Hide My Email request cookie / 自动捕获 iCloud Cookie"
     try:
-        ok = asyncio.run(_capture_cookie(cookie_file, region))
+        ok = asyncio.run(
+            _capture_cookie(
+                cookie_file,
+                region,
+                browser=browser,
+                timeout_seconds=timeout_seconds,
+            )
+        )
     except KeyboardInterrupt:
         return
 
@@ -1389,7 +1454,13 @@ async def _sync_hme_to_db(
         conn.close()
 
 
-async def _capture_cookie(cookie_file: str, region: str = DEFAULT_REGION) -> bool:
+async def _capture_cookie(
+    cookie_file: str,
+    region: str = DEFAULT_REGION,
+    *,
+    browser: str = "auto",
+    timeout_seconds: int = 300,
+) -> bool:
     console = Console()
     try:
         from playwright.async_api import async_playwright
@@ -1415,7 +1486,7 @@ async def _capture_cookie(cookie_file: str, region: str = DEFAULT_REGION) -> boo
     async with async_playwright() as playwright:
         context = None
         last_error = None
-        for channel in ["msedge", "chrome"]:
+        for channel in CAPTURE_BROWSER_CHANNELS[browser]:
             try:
                 context = await playwright.chromium.launch_persistent_context(
                     str(profile_dir),
@@ -1427,32 +1498,48 @@ async def _capture_cookie(cookie_file: str, region: str = DEFAULT_REGION) -> boo
             except Exception as e:
                 last_error = e
 
-        if context is None:
+        if context is None and browser == "auto":
             try:
                 context = await playwright.chromium.launch_persistent_context(
                     str(profile_dir),
                     headless=False,
                     viewport={"width": 1280, "height": 900},
                 )
-            except Exception:
-                console.log(
-                    "[bold red][ERR][/] Could not start a browser. Install Microsoft Edge or run: uv run playwright install chromium"
-                )
-                if last_error:
-                    console.log(f"[dim]{last_error}[/]")
-                return False
+            except Exception as e:
+                last_error = e
+
+        if context is None:
+            console.log(
+                "[bold red][ERR][/] Could not start the selected browser. "
+                "Install Microsoft Edge or Google Chrome, or run: "
+                "uv run playwright install chromium"
+            )
+            if last_error:
+                console.log(f"[dim]{last_error}[/]")
+            return False
 
         page = context.pages[0] if context.pages else await context.new_page()
 
-        def on_request(request):
-            if HIDEMYEMAIL_APP_PATH not in request.url:
+        async def capture_request_cookie(request) -> None:
+            if not is_hidemyemail_app_request(request.url, region):
                 return
-            if "rootDomain=www" not in request.url:
+            try:
+                headers = await request.all_headers()
+                cookie = headers.get("cookie", "")
+                if not cookie:
+                    cookie_urls = [
+                        request.url,
+                        SETUP_VALIDATE_URLS[region],
+                        f"https://{HideMyEmail.REGION_CONFIG[region]['maildomain_host']}/",
+                    ]
+                    cookie = browser_cookie_header(await context.cookies(cookie_urls))
+                if cookie and not captured.done():
+                    captured.set_result((request.url, cookie))
+            except Exception:
                 return
 
-            cookie = request.headers.get("cookie", "")
-            if cookie and not captured.done():
-                captured.set_result((request.url, cookie))
+        def on_request(request):
+            asyncio.create_task(capture_request_cookie(request))
 
         context.on("request", on_request)
 
@@ -1462,8 +1549,10 @@ async def _capture_cookie(cookie_file: str, region: str = DEFAULT_REGION) -> boo
         await page.goto(COOKIE_CAPTURE_URLS[region], wait_until="domcontentloaded")
 
         clicked = False
-        deadline = loop.time() + 300
+        deadline = loop.time() + timeout_seconds
         selectors = [
+            'article:has-text("Hide My Email") button',
+            'article:has-text("隐藏邮件地址") button',
             'button[aria-label*="隐藏邮件地址"]',
             'button[aria-label*="Hide My Email"]',
             '[data-testid="hidemyemail-app-icon"]',
