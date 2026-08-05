@@ -24,7 +24,8 @@ class BridgeResultTests(unittest.TestCase):
             result_file = Path(tmpdir) / "result.json"
             write_result_json(str(result_file), payload)
             self.assertEqual(json.loads(result_file.read_text()), payload)
-            self.assertEqual(os.stat(result_file).st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(os.stat(result_file).st_mode & 0o777, 0o600)
 
     def test_extracts_rate_limit_error(self):
         error = bridge_error(
