@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from hidemyemail_generator.main import RichHideMyEmail
 
@@ -29,12 +29,17 @@ class FakeTransport:
 
     def __init__(self, responses=None):
         self.calls = []
+        self.attempts = []
         self.responses = responses or {}
 
     async def __call__(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs.get("json")))
+        self.attempts.append(kwargs.get("attempts"))
         endpoint = url.rsplit("/", 1)[-1]
-        return self.responses.get(endpoint, {"success": True, "result": {}})
+        response = self.responses.get(endpoint, {"success": True, "result": {}})
+        if isinstance(response, list):
+            response = response.pop(0)
+        return response
 
 
 def run(coro):
@@ -73,6 +78,69 @@ class AddressManagementTests(unittest.TestCase):
         _, url, payload = self.transport.calls[-1]
         self.assertTrue(url.endswith("/v1/hme/reactivate"))
         self.assertEqual(payload, {"anonymousId": "abc-123"})
+
+    def test_delete_transport_is_never_retried(self):
+        result = run(self.hme.delete_email("abc-123"))
+        self.assertTrue(result["success"])
+        self.assertEqual(self.transport.attempts[-1], 1)
+
+    def test_permanent_delete_deactivates_active_address_and_verifies_absence(self):
+        self.transport.responses["list"] = [
+            LIST_RESPONSE,
+            {"success": True, "result": {"hmeEmails": []}},
+        ]
+        result = run(self.hme.permanently_delete("example@icloud.com"))
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["was_active"])
+        self.assertTrue(result["deactivated"])
+        self.assertTrue(result["verified_absent"])
+        self.assertEqual(
+            [call[1].rsplit("/", 1)[-1] for call in self.transport.calls],
+            ["list", "deactivate", "delete", "list"],
+        )
+
+    def test_permanent_delete_inactive_address_skips_deactivate(self):
+        inactive = {
+            "success": True,
+            "result": {"hmeEmails": [{**LIST_RESPONSE["result"]["hmeEmails"][0], "isActive": False}]},
+        }
+        self.transport.responses["list"] = [
+            inactive,
+            {"success": True, "result": {"hmeEmails": []}},
+        ]
+        result = run(self.hme.permanently_delete("example@icloud.com"))
+        self.assertTrue(result["ok"])
+        endpoints = [call[1].rsplit("/", 1)[-1] for call in self.transport.calls]
+        self.assertEqual(endpoints, ["list", "delete", "list"])
+
+    def test_ambiguous_delete_succeeds_only_when_list_confirms_absence(self):
+        self.transport.responses["delete"] = {
+            "error": 1,
+            "reason": "Request timed out after 30s",
+        }
+        self.transport.responses["list"] = [
+            LIST_RESPONSE,
+            {"success": True, "result": {"hmeEmails": []}},
+        ]
+        result = run(self.hme.permanently_delete("example@icloud.com"))
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified_absent"])
+        self.assertEqual(
+            sum(call[1].endswith("/delete") for call in self.transport.calls), 1
+        )
+
+    def test_lingering_address_fails_without_repeating_delete(self):
+        with patch(
+            "hidemyemail_generator.main.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            result = run(self.hme.permanently_delete("example@icloud.com"))
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["verified_absent"])
+        self.assertEqual(result["error"]["code"], "delete_verification_failed")
+        self.assertEqual(
+            sum(call[1].endswith("/delete") for call in self.transport.calls), 1
+        )
+        self.assertEqual(sleep.await_count, 3)
 
     def test_update_metadata_keeps_unspecified_fields(self):
         result = run(self.hme.update_metadata("example@icloud.com", "Renamed", None))

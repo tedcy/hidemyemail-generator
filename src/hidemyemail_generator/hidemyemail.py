@@ -101,19 +101,22 @@ class HideMyEmail:
         # remove new lines/whitespace for security reasons
         self.__cookies = cookies.strip()
 
-    async def _request_json(self, method: str, url: str, **kwargs) -> dict:
-        for attempt in range(REQUEST_RETRIES):
+    async def _request_json(
+        self, method: str, url: str, *, attempts: int = REQUEST_RETRIES, **kwargs
+    ) -> dict:
+        attempts = max(1, int(attempts))
+        for attempt in range(attempts):
             try:
                 async with self.s.request(method, url, **kwargs) as resp:
                     return await resp.json()
             except asyncio.TimeoutError:
-                if attempt == REQUEST_RETRIES - 1:
+                if attempt == attempts - 1:
                     return {
                         "error": 1,
                         "reason": f"Request timed out after {REQUEST_TIMEOUT_SECONDS}s",
                     }
             except Exception as e:
-                if attempt == REQUEST_RETRIES - 1:
+                if attempt == attempts - 1:
                     return {"error": 1, "reason": str(e)}
 
         return {"error": 1, "reason": "Request failed"}
@@ -176,4 +179,19 @@ class HideMyEmail:
             f"{self.base_url_v1}/reactivate",
             params=self.params,
             json={"anonymousId": anonymous_id},
+        )
+
+    async def delete_email(self, anonymous_id: str) -> dict:
+        """Permanently deletes an inactive address.
+
+        A timeout or disconnect leaves the remote result ambiguous.  Unlike
+        the idempotent list operations, the destructive POST is therefore
+        issued exactly once; callers must verify absence with list_email().
+        """
+        return await self._request_json(
+            "POST",
+            f"{self.base_url_v1}/delete",
+            params=self.params,
+            json={"anonymousId": anonymous_id},
+            attempts=1,
         )
