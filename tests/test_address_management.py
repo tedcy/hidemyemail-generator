@@ -113,6 +113,20 @@ class AddressManagementTests(unittest.TestCase):
         endpoints = [call[1].rsplit("/", 1)[-1] for call in self.transport.calls]
         self.assertEqual(endpoints, ["list", "delete", "list"])
 
+    def test_deactivate_failure_does_not_submit_delete(self):
+        self.transport.responses["deactivate"] = {
+            "success": False,
+            "error": {"errorCode": "deactivate_failed", "errorMessage": "rejected"},
+        }
+        self.transport.responses["list"] = [LIST_RESPONSE, LIST_RESPONSE]
+        result = run(self.hme.permanently_delete("example@icloud.com"))
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["delete_requested"])
+        self.assertEqual(
+            [call[1].rsplit("/", 1)[-1] for call in self.transport.calls],
+            ["list", "deactivate", "list"],
+        )
+
     def test_ambiguous_delete_succeeds_only_when_list_confirms_absence(self):
         self.transport.responses["delete"] = {
             "error": 1,
@@ -139,6 +153,32 @@ class AddressManagementTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "delete_verification_failed")
         self.assertEqual(
             sum(call[1].endswith("/delete") for call in self.transport.calls), 1
+        )
+        self.assertEqual(sleep.await_count, 3)
+
+    def test_verify_only_absent_uses_list_without_destructive_requests(self):
+        self.transport.responses["list"] = {
+            "success": True,
+            "result": {"hmeEmails": []},
+        }
+        result = run(self.hme.verify_permanent_delete("example@icloud.com"))
+        self.assertTrue(result["verified_absent"])
+        self.assertFalse(result["delete_requested"])
+        self.assertEqual(
+            [call[1].rsplit("/", 1)[-1] for call in self.transport.calls],
+            ["list"],
+        )
+
+    def test_verify_only_present_retries_lists_but_never_delete(self):
+        with patch(
+            "hidemyemail_generator.main.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            result = run(self.hme.verify_permanent_delete("example@icloud.com"))
+        self.assertFalse(result["verified_absent"])
+        self.assertFalse(result["delete_requested"])
+        self.assertEqual(
+            [call[1].rsplit("/", 1)[-1] for call in self.transport.calls],
+            ["list", "list", "list", "list"],
         )
         self.assertEqual(sleep.await_count, 3)
 

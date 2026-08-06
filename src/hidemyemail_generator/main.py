@@ -520,6 +520,64 @@ class RichHideMyEmail(HideMyEmail):
             True,
         )
 
+    async def verify_permanent_delete(
+        self,
+        email: str,
+        *,
+        was_active: Optional[bool] = None,
+        deactivated: bool = False,
+        delete_requested: bool = False,
+        already_absent: bool = True,
+        initial_error: Optional[dict] = None,
+    ) -> dict:
+        """Verify absence using only the idempotent list endpoint."""
+        last_row = None
+        verification_error = None
+        for delay in DELETE_VERIFY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            current, current_ok = await self._lookup_address(email)
+            if not current_ok:
+                verification_error = self.last_error
+                continue
+            if current is None:
+                self.console.log(
+                    f'[bold green][OK][/] "{email}" - Permanently deleted and verified / 已永久删除并核验'
+                )
+                return {
+                    "ok": True,
+                    "email": email,
+                    "was_active": was_active,
+                    "deactivated": deactivated,
+                    "delete_requested": delete_requested,
+                    "verified_absent": True,
+                    "already_absent": already_absent,
+                    "remote_state": "absent",
+                    "error": None,
+                }
+            last_row = current
+
+        self.last_error = initial_error or verification_error or {
+            "code": "delete_verification_failed",
+            "message": "Hide My Email address is still present after delete",
+            "retry_after": None,
+        }
+        return {
+            "ok": False,
+            "email": email,
+            "was_active": was_active,
+            "deactivated": deactivated,
+            "delete_requested": delete_requested,
+            "verified_absent": False,
+            "already_absent": False,
+            "remote_state": (
+                "active"
+                if last_row and last_row.get("isActive")
+                else "inactive" if last_row else "unknown"
+            ),
+            "error": self.last_error,
+        }
+
     async def permanently_delete(self, email: str) -> dict:
         """Deactivate, permanently delete, and verify an address is absent."""
         self.last_error = None
@@ -606,48 +664,14 @@ class RichHideMyEmail(HideMyEmail):
         delete_response = await self.delete_email(anonymous_id)
         delete_accepted = self._check_response(delete_response, "delete email", email)
         delete_error = None if delete_accepted else self.last_error
-        last_row = row
-        verification_error = None
-        for delay in DELETE_VERIFY_DELAYS:
-            if delay:
-                await asyncio.sleep(delay)
-            current, current_ok = await self._lookup_address(email)
-            if not current_ok:
-                verification_error = self.last_error
-                continue
-            if current is None:
-                self.console.log(
-                    f'[bold green][OK][/] "{email}" - Permanently deleted and verified / 已永久删除并核验'
-                )
-                return {
-                    "ok": True,
-                    "email": email,
-                    "was_active": was_active,
-                    "deactivated": deactivated,
-                    "delete_requested": True,
-                    "verified_absent": True,
-                    "already_absent": False,
-                    "remote_state": "absent",
-                    "error": None,
-                }
-            last_row = current
-
-        self.last_error = delete_error or verification_error or {
-            "code": "delete_verification_failed",
-            "message": "Hide My Email address is still present after delete",
-            "retry_after": None,
-        }
-        return {
-            "ok": False,
-            "email": email,
-            "was_active": was_active,
-            "deactivated": deactivated,
-            "delete_requested": True,
-            "verified_absent": False,
-            "already_absent": False,
-            "remote_state": "active" if last_row.get("isActive") else "inactive",
-            "error": self.last_error,
-        }
+        return await self.verify_permanent_delete(
+            email,
+            was_active=was_active,
+            deactivated=deactivated,
+            delete_requested=True,
+            already_absent=False,
+            initial_error=delete_error,
+        )
 
     async def update_metadata(
         self, email: str, label: Optional[str], note: Optional[str]
@@ -959,9 +983,23 @@ def reactivatecommand(email: str, cookie_file: str, region: str, result_json: Op
     type=click.Path(dir_okay=False),
     help="Write a machine-readable result to this file",
 )
-def deletecommand(email: str, cookie_file: str, region: str, result_json: Optional[str]):
+@click.option(
+    "--verify-only",
+    is_flag=True,
+    help="Only verify that the address is absent; never submit deactivate or delete",
+)
+def deletecommand(
+    email: str,
+    cookie_file: str,
+    region: str,
+    result_json: Optional[str],
+    verify_only: bool,
+):
     "Permanently delete an address after deactivation / 永久删除隐藏邮箱"
-    _run_address_command(_permanent_delete(email, cookie_file, region), result_json)
+    _run_address_command(
+        _permanent_delete(email, cookie_file, region, verify_only=verify_only),
+        result_json,
+    )
 
 
 @click.command()
@@ -1520,9 +1558,15 @@ async def _update_metadata(
 
 
 async def _permanent_delete(
-    email: str, cookie_file: str, region: str = DEFAULT_REGION
+    email: str,
+    cookie_file: str,
+    region: str = DEFAULT_REGION,
+    *,
+    verify_only: bool = False,
 ) -> dict:
     async with RichHideMyEmail(cookie_file=cookie_file, region=region) as hme:
+        if verify_only:
+            return await hme.verify_permanent_delete(email)
         return await hme.permanently_delete(email)
 
 
