@@ -60,10 +60,13 @@ CAPTURE_BROWSER_CHANNELS = {
 }
 MAILDOMAIN_HOST_PATTERNS = {
     "global": re.compile(
-        r"p[1-9][0-9]*-maildomainws\.icloud\.com", re.IGNORECASE
+        r"p[1-9][0-9]*-maildomainws(?:-china)?\.icloud\.com",
+        re.IGNORECASE,
     ),
     "china": re.compile(
-        r"p[1-9][0-9]*-maildomainws\.icloud\.com\.cn", re.IGNORECASE
+        r"p[1-9][0-9]*-(?:maildomainws\.icloud\.com\.cn|"
+        r"maildomainws-china\.icloud\.com)",
+        re.IGNORECASE,
     ),
 }
 
@@ -298,11 +301,19 @@ def load_cookie_context(cookie_file: str, region: str) -> tuple[str, str]:
         return cookie.strip(), maildomain_host
 
     if not maildomain_host:
+        shard_url = re.search(
+            r"https://([A-Za-z0-9.-]+)(?::443)?(?:[/\s'\"]|$)",
+            normalized_content,
+        )
+        if shard_url:
+            maildomain_host = normalize_maildomain_host(
+                shard_url.group(1), region
+            )
         shard = re.search(
             r"https://(p\d+)-[^/\s'\"]+\.icloud\.com(?:\.cn)?",
             normalized_content,
         )
-        if shard:
+        if not maildomain_host and shard:
             maildomain_host = normalize_maildomain_host(
                 f"{shard.group(1)}-maildomainws.icloud.{maildomain_suffix(region)}",
                 region,

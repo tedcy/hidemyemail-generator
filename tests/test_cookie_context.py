@@ -85,6 +85,19 @@ class CookieContextTests(unittest.TestCase):
                 "china",
             )
         )
+        self.assertTrue(
+            is_hidemyemail_list_request(
+                "https://p224-maildomainws-china.icloud.com/v2/hme/list"
+                "?clientBuildNumber=synthetic",
+                "global",
+            )
+        )
+        self.assertTrue(
+            is_hidemyemail_list_request(
+                "https://p224-maildomainws-china.icloud.com/v2/hme/list",
+                "china",
+            )
+        )
         rejected = (
             "http://p111-maildomainws.icloud.com/v2/hme/list",
             "https://p111-maildomainws.icloud.com.cn/v2/hme/list",
@@ -94,6 +107,8 @@ class CookieContextTests(unittest.TestCase):
             "https://p111-maildomainws.icloud.com/v1/hme/list",
             "https://p111-maildomainws.icloud.com/v2/hme/list/",
             "https://p111-maildomainws.icloud.com/v2/hme/list#fragment",
+            "https://p224-maildomainws-china.icloud.com.evil.test/v2/hme/list",
+            "https://p224-maildomainws-china.evil.test/v2/hme/list",
         )
         for request_url in rejected:
             with self.subTest(request_url=request_url):
@@ -118,6 +133,13 @@ class CookieContextTests(unittest.TestCase):
         )
         self.assertEqual(
             "p123-maildomainws.icloud.com",
+            resolve_maildomain_host(account, "global"),
+        )
+        account["webservices"]["premiummailsettings"]["url"] = (
+            "https://p224-maildomainws-china.icloud.com/v2/hme"
+        )
+        self.assertEqual(
+            "p224-maildomainws-china.icloud.com",
             resolve_maildomain_host(account, "global"),
         )
         account["webservices"]["premiummailsettings"]["url"] = (
@@ -154,6 +176,28 @@ class CookieContextTests(unittest.TestCase):
             cookie, host = load_cookie_context(str(cookie_file), "global")
             self.assertEqual("X-APPLE-WEBAUTH-USER=secret", cookie)
             self.assertEqual("p111-maildomainws.icloud.com", host)
+
+    def test_china_shard_cookie_file_strips_request_query(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cookie_file = Path(tmpdir) / "cookies.txt"
+            write_captured_cookie(
+                str(cookie_file),
+                "X-APPLE-WEBAUTH-USER=synthetic",
+                "global",
+                "https://p224-maildomainws-china.icloud.com/v2/hme/list"
+                "?clientBuildNumber=synthetic&dsid=synthetic",
+                "p224-maildomainws-china.icloud.com",
+            )
+            content = cookie_file.read_text(encoding="utf-8")
+            self.assertIn(
+                "HIDEMYEMAIL_REQUEST_URL="
+                "https://p224-maildomainws-china.icloud.com/v2/hme/list",
+                content,
+            )
+            self.assertNotIn("?", content)
+            cookie, host = load_cookie_context(str(cookie_file), "global")
+            self.assertEqual("X-APPLE-WEBAUTH-USER=synthetic", cookie)
+            self.assertEqual("p224-maildomainws-china.icloud.com", host)
 
     def test_builds_cookie_header_from_browser_cookie_records(self):
         self.assertEqual(
