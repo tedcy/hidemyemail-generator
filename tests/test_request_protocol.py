@@ -1,8 +1,11 @@
 import asyncio
+import json
+import socket
+import ssl
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from hidemyemail_generator.hidemyemail import HideMyEmail
+from hidemyemail_generator.hidemyemail import HideMyEmail, _request_failure_reason
 
 
 # Mirrors the iCloud web client request the values were captured from. Update
@@ -25,6 +28,32 @@ CAPTURED_HEADERS = {
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"macOS"',
 }
+
+
+class FakeResponse:
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    async def __aenter__(self):
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def json(self):
+        return self.outcome
+
+
+class FakeSession:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def request(self, *_args, **_kwargs):
+        self.calls += 1
+        return FakeResponse(self.outcomes.pop(0))
 
 
 class RequestProtocolTests(unittest.TestCase):
@@ -57,6 +86,47 @@ class RequestProtocolTests(unittest.TestCase):
             with patch.object(HideMyEmail, "_request_json", fake_request):
                 asyncio.run(HideMyEmail(region=region).generate_email())
             self.assertEqual(seen[-1], {"langCode": expected})
+
+    def test_transient_request_retries_with_short_backoff(self):
+        client = HideMyEmail()
+        client.s = FakeSession(
+            [asyncio.TimeoutError(), {"success": True, "result": {}}]
+        )
+        with patch(
+            "hidemyemail_generator.hidemyemail.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            result = asyncio.run(client.list_email())
+        self.assertTrue(result["success"])
+        self.assertEqual(2, client.s.calls)
+        sleep.assert_awaited_once_with(0.5)
+
+    def test_exhausted_timeout_returns_only_fixed_reason(self):
+        client = HideMyEmail()
+        client.s = FakeSession([asyncio.TimeoutError(), asyncio.TimeoutError()])
+        with patch(
+            "hidemyemail_generator.hidemyemail.asyncio.sleep", new=AsyncMock()
+        ):
+            result = asyncio.run(client.list_email())
+        self.assertEqual({"error": 1, "reason": "request_timeout"}, result)
+
+    def test_non_object_response_is_classified_without_body(self):
+        client = HideMyEmail()
+        client.s = FakeSession([["unexpected"], ["still-unexpected"]])
+        with patch(
+            "hidemyemail_generator.hidemyemail.asyncio.sleep", new=AsyncMock()
+        ):
+            result = asyncio.run(client.list_email())
+        self.assertEqual({"error": 1, "reason": "response_invalid_json"}, result)
+
+    def test_request_failure_classification_uses_fixed_enums(self):
+        self.assertEqual(
+            "request_dns_error", _request_failure_reason(socket.gaierror())
+        )
+        self.assertEqual("request_tls_error", _request_failure_reason(ssl.SSLError()))
+        self.assertEqual(
+            "response_invalid_json",
+            _request_failure_reason(json.JSONDecodeError("bad", "x", 0)),
+        )
 
 
 if __name__ == "__main__":

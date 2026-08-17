@@ -58,6 +58,14 @@ CAPTURE_BROWSER_CHANNELS = {
     "chrome": ("chrome",),
     "edge": ("msedge",),
 }
+MAILDOMAIN_HOST_PATTERNS = {
+    "global": re.compile(
+        r"p[1-9][0-9]*-maildomainws\.icloud\.com", re.IGNORECASE
+    ),
+    "china": re.compile(
+        r"p[1-9][0-9]*-maildomainws\.icloud\.com\.cn", re.IGNORECASE
+    ),
+}
 
 
 def is_hidemyemail_app_request(request_url: str, region: str) -> bool:
@@ -80,6 +88,96 @@ def is_hidemyemail_app_request(request_url: str, region: str) -> bool:
     return bool(root_domains) and all(value == "www" for value in root_domains)
 
 
+def normalize_maildomain_host(value: object, region: str) -> str:
+    """Return a region-scoped Apple maildomain host or an empty string."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw if "://" in raw else f"//{raw}")
+        if parsed.scheme and parsed.scheme.lower() != "https":
+            return ""
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        if parsed.port not in {None, 443}:
+            return ""
+        hostname = str(parsed.hostname or "").lower()
+        pattern = MAILDOMAIN_HOST_PATTERNS[region]
+    except (KeyError, TypeError, ValueError):
+        return ""
+    return hostname if pattern.fullmatch(hostname) else ""
+
+
+def hidemyemail_list_request_host(request_url: str, region: str) -> str:
+    """Extract the account's real HME shard from a strict list request URL."""
+    try:
+        parsed = urlparse(request_url)
+        if parsed.scheme.lower() != "https":
+            return ""
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        if parsed.port not in {None, 443} or parsed.fragment:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    host = normalize_maildomain_host(parsed.hostname, region)
+    if not host or parsed.path != "/v2/hme/list":
+        return ""
+    return host
+
+
+def is_hidemyemail_list_request(request_url: str, region: str) -> bool:
+    """Match only the real, account-sharded HME list request."""
+    return bool(hidemyemail_list_request_host(request_url, region))
+
+
+def safe_hidemyemail_request_url(request_url: str, region: str) -> str:
+    """Strip query data such as DSID before persisting a captured request URL."""
+    host = hidemyemail_list_request_host(request_url, region)
+    if not host:
+        raise ValueError("invalid_hidemyemail_list_request")
+    return f"https://{host}/v2/hme/list"
+
+
+def resolve_maildomain_host(
+    account: dict, region: str, captured_maildomain_host: str = ""
+) -> str:
+    """Resolve an HME host without trusting an arbitrary validate response URL."""
+    detected_host = normalize_maildomain_host(captured_maildomain_host, region)
+    webservices = account.get("webservices")
+    premium_settings = (
+        webservices.get("premiummailsettings")
+        if isinstance(webservices, dict)
+        else None
+    )
+    premium_url = (
+        premium_settings.get("url")
+        if isinstance(premium_settings, dict)
+        else premium_settings
+        if isinstance(premium_settings, str)
+        else ""
+    )
+    if not detected_host:
+        detected_host = normalize_maildomain_host(premium_url, region)
+
+    user_partition = account.get("userPartition")
+    if not detected_host and user_partition is not None:
+        try:
+            partition = int(user_partition)
+        except (TypeError, ValueError):
+            partition = 0
+        if partition > 0:
+            detected_host = normalize_maildomain_host(
+                f"p{partition}-maildomainws.icloud.{maildomain_suffix(region)}",
+                region,
+            )
+    if not detected_host:
+        detected_host = normalize_maildomain_host(
+            HideMyEmail.REGION_CONFIG[region]["maildomain_host"], region
+        )
+    return detected_host
+
+
 def browser_cookie_header(cookies: list[dict]) -> str:
     pairs = []
     seen_names = set()
@@ -91,6 +189,15 @@ def browser_cookie_header(cookies: list[dict]) -> str:
         seen_names.add(name)
         pairs.append(f"{name}={value}")
     return "; ".join(pairs)
+
+
+async def browser_request_cookie_header(request, context) -> str:
+    """Read the actual request Cookie header, with a scoped browser fallback."""
+    headers = await request.all_headers()
+    cookie = str(headers.get("cookie") or "").strip()
+    if cookie:
+        return cookie
+    return browser_cookie_header(await context.cookies([request.url]))
 
 
 def maildomain_suffix(region: str) -> str:
@@ -178,7 +285,9 @@ def load_cookie_context(cookie_file: str, region: str) -> tuple[str, str]:
         normalized_content,
     )
     if explicit_maildomain_host:
-        maildomain_host = explicit_maildomain_host.group(1).strip()
+        maildomain_host = normalize_maildomain_host(
+            explicit_maildomain_host.group(1), region
+        )
 
     encoded_cookie = re.search(
         r"(?m)^HIDEMYEMAIL_COOKIE_BASE64=([A-Za-z0-9+/=]+)\s*$",
@@ -188,13 +297,16 @@ def load_cookie_context(cookie_file: str, region: str) -> tuple[str, str]:
         cookie = base64.b64decode(encoded_cookie.group(1)).decode("utf-8")
         return cookie.strip(), maildomain_host
 
-    shard = re.search(
-        r"https://(p\d+)-[^/\s'\"]+\.icloud\.com(?:\.cn)?", normalized_content
-    )
-    if shard:
-        maildomain_host = (
-            f"{shard.group(1)}-maildomainws.icloud.{maildomain_suffix(region)}"
+    if not maildomain_host:
+        shard = re.search(
+            r"https://(p\d+)-[^/\s'\"]+\.icloud\.com(?:\.cn)?",
+            normalized_content,
         )
+        if shard:
+            maildomain_host = normalize_maildomain_host(
+                f"{shard.group(1)}-maildomainws.icloud.{maildomain_suffix(region)}",
+                region,
+            )
 
     cmd_cookie_arg = re.search(
         r"(?:^|\s)(?:-b|--cookie)\s+\^\"(.+?)\^\"\s+\^?\s*-[A-Za-z]",
@@ -261,13 +373,12 @@ async def fetch_account_info_from_cookie(
         reason = data.get("reason") or data.get("error") or response.status
         return {"error": f"Failed to validate cookie: {reason}"}
 
-    user_partition = data.get("userPartition")
-    if not maildomain_host and user_partition:
-        maildomain_host = (
-            f"p{user_partition}-maildomainws.icloud.{maildomain_suffix(region)}"
-        )
-
-    data["detectedMaildomainHost"] = maildomain_host
+    # The browser's actual list request is authoritative.  Apple's validate
+    # response is the next-best source because accounts can live on shards
+    # unrelated to the historical userPartition/default-host mapping.
+    data["detectedMaildomainHost"] = resolve_maildomain_host(
+        data, region, maildomain_host
+    )
     return data
 
 
@@ -278,14 +389,18 @@ def write_captured_cookie(
     if path.exists() and path.stat().st_size > 0:
         shutil.copy2(path, path.with_name(f"{path.name}.bak"))
 
+    safe_request_url = safe_hidemyemail_request_url(request_url, region)
+    safe_maildomain_host = normalize_maildomain_host(maildomain_host, region)
+    if not safe_maildomain_host:
+        safe_maildomain_host = hidemyemail_list_request_host(request_url, region)
     encoded_cookie = base64.b64encode(cookie.encode("utf-8")).decode("ascii")
     path.write_text(
         "\n".join(
             [
                 "# Generated by hidemyemail capture-cookie.",
                 f"HIDEMYEMAIL_REGION={region}",
-                f"HIDEMYEMAIL_REQUEST_URL={request_url}",
-                f"HIDEMYEMAIL_MAILDOMAIN_HOST={maildomain_host}",
+                f"HIDEMYEMAIL_REQUEST_URL={safe_request_url}",
+                f"HIDEMYEMAIL_MAILDOMAIN_HOST={safe_maildomain_host}",
                 f"HIDEMYEMAIL_COOKIE_BASE64={encoded_cookie}",
                 "",
             ]
@@ -1754,20 +1869,13 @@ async def _capture_cookie(
         page = context.pages[0] if context.pages else await context.new_page()
 
         async def capture_request_cookie(request) -> None:
-            if not is_hidemyemail_app_request(request.url, region):
+            maildomain_host = hidemyemail_list_request_host(request.url, region)
+            if not maildomain_host:
                 return
             try:
-                headers = await request.all_headers()
-                cookie = headers.get("cookie", "")
-                if not cookie:
-                    cookie_urls = [
-                        request.url,
-                        SETUP_VALIDATE_URLS[region],
-                        f"https://{HideMyEmail.REGION_CONFIG[region]['maildomain_host']}/",
-                    ]
-                    cookie = browser_cookie_header(await context.cookies(cookie_urls))
+                cookie = await browser_request_cookie_header(request, context)
                 if cookie and not captured.done():
-                    captured.set_result((request.url, cookie))
+                    captured.set_result((request.url, cookie, maildomain_host))
             except Exception:
                 return
 
@@ -1813,8 +1921,10 @@ async def _capture_cookie(
             )
             return False
 
-        request_url, cookie = captured.result()
-        account = await fetch_account_info_from_cookie(cookie, region)
+        request_url, cookie, captured_maildomain_host = captured.result()
+        account = await fetch_account_info_from_cookie(
+            cookie, region, captured_maildomain_host
+        )
         if "error" in account:
             await context.close()
             console.log(f"[bold red][ERR][/] Captured cookie did not validate: {account['error']}")

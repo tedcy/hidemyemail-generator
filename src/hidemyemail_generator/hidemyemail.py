@@ -1,11 +1,43 @@
 import asyncio
-import aiohttp
+import json
+import socket
 import ssl
+
+import aiohttp
 import certifi
 
 
 REQUEST_TIMEOUT_SECONDS = 30
 REQUEST_RETRIES = 2
+REQUEST_RETRY_DELAYS = (0.5, 1.0)
+
+
+def _request_failure_reason(exc: BaseException) -> str:
+    if isinstance(
+        exc, (aiohttp.ContentTypeError, json.JSONDecodeError, UnicodeDecodeError)
+    ):
+        return "response_invalid_json"
+    if isinstance(exc, socket.gaierror):
+        return "request_dns_error"
+    if isinstance(
+        exc,
+        (
+            aiohttp.ClientConnectorCertificateError,
+            aiohttp.ClientConnectorSSLError,
+            aiohttp.ClientSSLError,
+            ssl.SSLError,
+        ),
+    ):
+        return "request_tls_error"
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        if isinstance(getattr(exc, "os_error", None), socket.gaierror):
+            return "request_dns_error"
+        return "request_network_error"
+    if isinstance(
+        exc, (aiohttp.ClientConnectionError, aiohttp.ClientError, OSError)
+    ):
+        return "request_network_error"
+    return "request_failed"
 
 
 class HideMyEmail:
@@ -106,18 +138,24 @@ class HideMyEmail:
     ) -> dict:
         attempts = max(1, int(attempts))
         for attempt in range(attempts):
+            failure_reason = "request_failed"
             try:
                 async with self.s.request(method, url, **kwargs) as resp:
-                    return await resp.json()
+                    payload = await resp.json()
+                    if isinstance(payload, dict):
+                        return payload
+                    failure_reason = "response_invalid_json"
             except asyncio.TimeoutError:
-                if attempt == attempts - 1:
-                    return {
-                        "error": 1,
-                        "reason": f"Request timed out after {REQUEST_TIMEOUT_SECONDS}s",
-                    }
-            except Exception as e:
-                if attempt == attempts - 1:
-                    return {"error": 1, "reason": str(e)}
+                failure_reason = "request_timeout"
+            except Exception as exc:
+                failure_reason = _request_failure_reason(exc)
+
+            if attempt == attempts - 1:
+                return {"error": 1, "reason": failure_reason}
+            delay = REQUEST_RETRY_DELAYS[
+                min(attempt, len(REQUEST_RETRY_DELAYS) - 1)
+            ]
+            await asyncio.sleep(delay)
 
         return {"error": 1, "reason": "Request failed"}
 

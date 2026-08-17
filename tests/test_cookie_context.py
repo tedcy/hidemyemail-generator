@@ -1,15 +1,21 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from click.testing import CliRunner
 
 from hidemyemail_generator.main import (
     browser_cookie_header,
+    browser_request_cookie_header,
     capturecookiecommand,
     is_hidemyemail_app_request,
+    is_hidemyemail_list_request,
     load_cookie_context,
+    resolve_maildomain_host,
+    write_captured_cookie,
 )
 
 
@@ -66,6 +72,89 @@ class CookieContextTests(unittest.TestCase):
                     is_hidemyemail_app_request(request_url, "global")
                 )
 
+    def test_matches_only_region_scoped_hme_list_requests(self):
+        self.assertTrue(
+            is_hidemyemail_list_request(
+                "https://p111-maildomainws.icloud.com/v2/hme/list?dsid=123",
+                "global",
+            )
+        )
+        self.assertTrue(
+            is_hidemyemail_list_request(
+                "https://p217-maildomainws.icloud.com.cn/v2/hme/list?dsid=123",
+                "china",
+            )
+        )
+        rejected = (
+            "http://p111-maildomainws.icloud.com/v2/hme/list",
+            "https://p111-maildomainws.icloud.com.cn/v2/hme/list",
+            "https://p111-maildomainws.icloud.com.evil.test/v2/hme/list",
+            "https://user@p111-maildomainws.icloud.com/v2/hme/list",
+            "https://p111-maildomainws.icloud.com:444/v2/hme/list",
+            "https://p111-maildomainws.icloud.com/v1/hme/list",
+            "https://p111-maildomainws.icloud.com/v2/hme/list/",
+            "https://p111-maildomainws.icloud.com/v2/hme/list#fragment",
+        )
+        for request_url in rejected:
+            with self.subTest(request_url=request_url):
+                self.assertFalse(
+                    is_hidemyemail_list_request(request_url, "global")
+                )
+
+    def test_maildomain_resolution_prefers_capture_then_premium_service(self):
+        account = {
+            "userPartition": "68",
+            "webservices": {
+                "premiummailsettings": {
+                    "url": "https://p123-maildomainws.icloud.com/v2/hme"
+                }
+            },
+        }
+        self.assertEqual(
+            "p168-maildomainws.icloud.com",
+            resolve_maildomain_host(
+                account, "global", "p168-maildomainws.icloud.com"
+            ),
+        )
+        self.assertEqual(
+            "p123-maildomainws.icloud.com",
+            resolve_maildomain_host(account, "global"),
+        )
+        account["webservices"]["premiummailsettings"]["url"] = (
+            "https://p217-maildomainws.icloud.com.cn/v2/hme"
+        )
+        self.assertEqual(
+            "p68-maildomainws.icloud.com",
+            resolve_maildomain_host(account, "global"),
+        )
+        self.assertEqual(
+            "p68-maildomainws.icloud.com",
+            resolve_maildomain_host({}, "global"),
+        )
+
+    def test_captured_cookie_file_strips_request_query(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cookie_file = Path(tmpdir) / "cookies.txt"
+            write_captured_cookie(
+                str(cookie_file),
+                "X-APPLE-WEBAUTH-USER=secret",
+                "global",
+                "https://p111-maildomainws.icloud.com/v2/hme/list"
+                "?dsid=sensitive&clientBuildNumber=1",
+                "p111-maildomainws.icloud.com",
+            )
+            content = cookie_file.read_text(encoding="utf-8")
+            self.assertIn(
+                "HIDEMYEMAIL_REQUEST_URL="
+                "https://p111-maildomainws.icloud.com/v2/hme/list",
+                content,
+            )
+            self.assertNotIn("dsid", content.lower())
+            self.assertNotIn("sensitive", content)
+            cookie, host = load_cookie_context(str(cookie_file), "global")
+            self.assertEqual("X-APPLE-WEBAUTH-USER=secret", cookie)
+            self.assertEqual("p111-maildomainws.icloud.com", host)
+
     def test_builds_cookie_header_from_browser_cookie_records(self):
         self.assertEqual(
             browser_cookie_header(
@@ -78,6 +167,22 @@ class CookieContextTests(unittest.TestCase):
             ),
             "X-APPLE-WEBAUTH-USER=valid; session=valid",
         )
+
+    def test_request_cookie_falls_back_to_exact_captured_url(self):
+        request = SimpleNamespace(
+            url="https://p168-maildomainws.icloud.com/v2/hme/list?dsid=123",
+            all_headers=AsyncMock(return_value={}),
+        )
+        context = SimpleNamespace(
+            cookies=AsyncMock(
+                return_value=[
+                    {"name": "X-APPLE-WEBAUTH-USER", "value": "valid"}
+                ]
+            )
+        )
+        cookie = asyncio.run(browser_request_cookie_header(request, context))
+        self.assertEqual("X-APPLE-WEBAUTH-USER=valid", cookie)
+        context.cookies.assert_awaited_once_with([request.url])
 
     def test_capture_cli_exposes_browser_and_timeout_controls(self):
         result = CliRunner().invoke(capturecookiecommand, ["--help"])
