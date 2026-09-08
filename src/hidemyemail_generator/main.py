@@ -228,11 +228,33 @@ def bridge_error(response: dict | None) -> dict:
         message = response.get("reason") or str(error or "Unknown error")
         retry_after = response.get("retryAfter")
 
-    return {
+    transport = response.get("_transport")
+    if not isinstance(transport, dict):
+        transport = error if isinstance(error, dict) else response
+    result = {
         "code": str(code) if code is not None else None,
         "message": str(message),
         "retry_after": retry_after if isinstance(retry_after, (int, float)) else None,
     }
+    try:
+        http_status = int(transport.get("http_status"))
+    except (TypeError, ValueError, AttributeError):
+        http_status = None
+    if http_status is not None and 100 <= http_status <= 599:
+        result["http_status"] = http_status
+    response_kind = str(transport.get("response_kind") or "").strip().lower()
+    if response_kind in {
+        "auth_required",
+        "edge_blocked",
+        "rate_limited",
+        "transient",
+        "invalid_response",
+    }:
+        result["response_kind"] = response_kind
+    content_type = str(transport.get("content_type") or "").strip().lower()
+    if len(content_type) <= 80 and "/" in content_type and " " not in content_type:
+        result["content_type"] = content_type
+    return result
 
 
 def write_result_json(result_file: str | None, payload: dict) -> None:

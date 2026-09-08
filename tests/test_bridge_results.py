@@ -40,6 +40,32 @@ class BridgeResultTests(unittest.TestCase):
         self.assertEqual(error["code"], "-41015")
         self.assertEqual(error["retry_after"], 2)
 
+    def test_extracts_fixed_transport_metadata_without_body(self):
+        error = bridge_error(
+            {
+                "error": {
+                    "code": None,
+                    "message": "response_invalid_json",
+                    "retry_after": None,
+                    "http_status": 403,
+                    "response_kind": "edge_blocked",
+                    "content_type": "text/html",
+                }
+            }
+        )
+        self.assertEqual(
+            {
+                "code": None,
+                "message": "response_invalid_json",
+                "retry_after": None,
+                "http_status": 403,
+                "response_kind": "edge_blocked",
+                "content_type": "text/html",
+            },
+            error,
+        )
+        self.assertNotIn("body", json.dumps(error).lower())
+
     def test_account_result_never_contains_cookie(self):
         summary = account_summary(
             {

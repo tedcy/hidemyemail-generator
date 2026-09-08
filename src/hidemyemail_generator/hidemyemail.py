@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import socket
 import ssl
 
@@ -10,6 +11,63 @@ import certifi
 REQUEST_TIMEOUT_SECONDS = 30
 REQUEST_RETRIES = 2
 REQUEST_RETRY_DELAYS = (0.5, 1.0)
+_MIME_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
+
+
+def _safe_http_status(value) -> int | None:
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _safe_content_type(headers) -> str | None:
+    try:
+        raw = str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    except (AttributeError, TypeError):
+        return None
+    return raw if len(raw) <= 80 and _MIME_RE.fullmatch(raw) else None
+
+
+def _response_kind(status: int | None, content_type: str | None) -> str:
+    if status == 401:
+        return "auth_required"
+    if status == 429:
+        return "rate_limited"
+    if status == 403:
+        return "edge_blocked"
+    if status in {408, 425} or (status is not None and 500 <= status <= 599):
+        return "transient"
+    # A non-JSON response from a proxy/edge is intentionally not classified as
+    # a confirmed Apple block unless the status itself is a challenge status.
+    return "invalid_response"
+
+
+def _retry_after(headers, status: int | None) -> float | None:
+    if status != 429:
+        return None
+    try:
+        value = float(str(headers.get("Retry-After") or "").strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if 0 < value <= 86400 else None
+
+
+def _transport_metadata(response) -> dict:
+    status = _safe_http_status(getattr(response, "status", None))
+    content_type = _safe_content_type(getattr(response, "headers", None) or {})
+    metadata = {}
+    if status is not None:
+        metadata.update(
+            {"http_status": status, "response_kind": _response_kind(status, content_type)}
+        )
+    if content_type:
+        metadata["content_type"] = content_type
+    retry_after = _retry_after(getattr(response, "headers", None) or {}, status)
+    if retry_after is not None:
+        metadata["retry_after"] = retry_after
+    return metadata
 
 
 def _request_failure_reason(exc: BaseException) -> str:
@@ -139,10 +197,22 @@ class HideMyEmail:
         attempts = max(1, int(attempts))
         for attempt in range(attempts):
             failure_reason = "request_failed"
+            transport = {}
             try:
                 async with self.s.request(method, url, **kwargs) as resp:
+                    transport = _transport_metadata(resp)
                     payload = await resp.json()
                     if isinstance(payload, dict):
+                        if (
+                            payload.get("success") is False
+                            or "error" in payload
+                            or int(transport.get("http_status") or 200) >= 400
+                        ):
+                            # Keep transport diagnostics separate from Apple's
+                            # response schema. The bridge consumes this key and
+                            # never exposes it as account data.
+                            payload = dict(payload)
+                            payload["_transport"] = transport
                         return payload
                     failure_reason = "response_invalid_json"
             except asyncio.TimeoutError:
@@ -151,7 +221,7 @@ class HideMyEmail:
                 failure_reason = _request_failure_reason(exc)
 
             if attempt == attempts - 1:
-                return {"error": 1, "reason": failure_reason}
+                return {"error": 1, "reason": failure_reason, **transport}
             delay = REQUEST_RETRY_DELAYS[
                 min(attempt, len(REQUEST_RETRY_DELAYS) - 1)
             ]

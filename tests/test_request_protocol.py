@@ -31,8 +31,10 @@ CAPTURED_HEADERS = {
 
 
 class FakeResponse:
-    def __init__(self, outcome):
+    def __init__(self, outcome, status=None, headers=None):
         self.outcome = outcome
+        self.status = status
+        self.headers = headers or {}
 
     async def __aenter__(self):
         if isinstance(self.outcome, BaseException):
@@ -53,7 +55,10 @@ class FakeSession:
 
     def request(self, *_args, **_kwargs):
         self.calls += 1
-        return FakeResponse(self.outcomes.pop(0))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, tuple):
+            return FakeResponse(*outcome)
+        return FakeResponse(outcome)
 
 
 class RequestProtocolTests(unittest.TestCase):
@@ -117,6 +122,20 @@ class RequestProtocolTests(unittest.TestCase):
         ):
             result = asyncio.run(client.list_email())
         self.assertEqual({"error": 1, "reason": "response_invalid_json"}, result)
+
+    def test_invalid_response_keeps_only_fixed_transport_metadata(self):
+        client = HideMyEmail()
+        response = (["unexpected"], 403, {"Content-Type": "text/html; charset=utf-8"})
+        client.s = FakeSession([response, response])
+        with patch(
+            "hidemyemail_generator.hidemyemail.asyncio.sleep", new=AsyncMock()
+        ):
+            result = asyncio.run(client.list_email())
+        self.assertEqual("response_invalid_json", result["reason"])
+        self.assertEqual(403, result["http_status"])
+        self.assertEqual("edge_blocked", result["response_kind"])
+        self.assertEqual("text/html", result["content_type"])
+        self.assertNotIn("unexpected", json.dumps(result))
 
     def test_request_failure_classification_uses_fixed_enums(self):
         self.assertEqual(
